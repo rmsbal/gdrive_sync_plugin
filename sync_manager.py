@@ -6,24 +6,33 @@ on a Drive upload, and throttles auto-triggered syncs so a burst of edit
 commits doesn't trigger several uploads back to back.
 
 Sync flow (see sync_layer / _sync_task):
+
   1. Resolve this user's Drive subfolder (and its "logs" subfolder)
      under the shared root folder configured in Settings - creating
      them the first time this user syncs.
+
   2. Figure out which local GeoPackage to upload:
        - If the active layer is already backed by a .gpkg file on
-         disk, that file *is* the upload - nothing is exported.
+         disk, that file *is* the upload - nothing is exported, the
+         whole GeoPackage container (all its internal layers) is sent
+         as-is.
        - Otherwise, reuse (or create) this user's local "working"
          GeoPackage and merge in any project layer not already saved
-         to it, as its own table, leaving existing tables untouched.
-     The local working-file path and the set of layers already merged
-     into it are remembered per user (state_store.py) so this never
-     changes just because the *remote* filename is versioned per sync.
-  3. Upload the GeoPackage to Drive under a versioned name:
-       <local_basename>_v<YYYYMMDD>_<HHMMSS>.gpkg
-     using a 24-hour clock. If that exact name somehow already exists
-     in the folder (e.g. two syncs in the same second), a numeric
-     suffix is added instead of overwriting, so a conflict always
-     produces a new version rather than clobbering a file.
+         to it, as its own table. Layers already merged in before are
+         re-written in place (same table, current data) rather than
+         skipped, so edits after the first merge are still captured.
+
+     The local working-file path and each merged layer's table name
+     are remembered per user (state_store.py), so the same physical
+     table is reused/updated instead of duplicated on every sync.
+
+  3. Upload under a STABLE name - the local file's own filename (e.g.
+     "roads.gpkg" or "<user_id>_working.gpkg"). Every sync checks
+     Drive for that exact name: found -> replace its content in
+     place; not found -> create it. No per-sync timestamped versions -
+     Drive's built-in revision history covers "what did this look like
+     before" if that's ever needed.
+
   4. Append a row to today's local CSV edit log for this user and
      push that file to their Drive "logs" folder (same filename all
      day, updated in place) so a reviewer can open one file to check
@@ -35,7 +44,6 @@ import re
 import time
 from datetime import datetime
 
-from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     Qgis, QgsTask, QgsApplication, QgsMessageLog,
     QgsVectorFileWriter, QgsProject, QgsVectorLayer,
@@ -44,15 +52,14 @@ from qgis.core import (
 
 from .settings_dialog import get_setting, get_client_secret_path
 from .drive_uploader import (
-    DriveUploaderError, resolve_user_paths, unique_remote_name,
-    upload_new_version, upload_or_replace, has_uploaded_version,
+    DriveUploaderError, resolve_user_paths, upload_or_replace, file_exists_in_folder,
 )
 from . import state_store
 from . import edit_logger
 
 PLUGIN_NAME = "GDrive Spatial Sync"
 
-# Throttles auto-sync (commit-triggered) calls so a rapid string of
+# Throttles auto-sync (commit/save-triggered) calls so a rapid string of
 # edits doesn't trigger several uploads back to back. Manual syncs
 # (the toolbar button) always run regardless of this.
 _MIN_SECONDS_BETWEEN_SYNCS = 5
@@ -270,7 +277,7 @@ class SyncManager:
                           root_folder_id, profile_dir):
         # Figure out which local GeoPackage *would* be uploaded for this
         # layer, without merging/writing anything yet - just to know
-        # what base name to look for online.
+        # what exact filename to look for online.
         if _is_gpkg_backed(layer):
             local_path = _gpkg_source_path(layer)
         else:
@@ -280,14 +287,15 @@ class SyncManager:
                 local_path = os.path.join(
                     profile_dir, "gdrive_sync_plugin", "working", f"{user_id}_working.gpkg"
                 )
-        base_name = os.path.splitext(os.path.basename(local_path))[0]
+
+        remote_filename = os.path.basename(local_path)
 
         try:
             user_folder_id, _logs_folder_id = resolve_user_paths(
                 client_secret_path, token_cache_path, root_folder_id, user_id
             )
-            already_online = has_uploaded_version(
-                client_secret_path, token_cache_path, user_folder_id, base_name
+            already_online = file_exists_in_folder(
+                client_secret_path, token_cache_path, user_folder_id, remote_filename
             )
         except DriveUploaderError as e:
             return {"skip": True, "reason": str(e)}
@@ -305,7 +313,6 @@ class SyncManager:
             return
         if not result or result.get("skip"):
             return
-
         layer = result.get("layer")
         if layer is not None:
             QgsMessageLog.logMessage(
@@ -320,9 +327,13 @@ class SyncManager:
     def _ensure_working_gpkg(self, profile_dir, user_id, trigger_layer):
         """
         Returns the path to this user's local working GeoPackage,
-        creating it if needed and merging in any project vector layer
-        that isn't already its own separate .gpkg file and hasn't
-        already been written into this working file.
+        creating it if needed and writing every project vector layer
+        that isn't already its own separate .gpkg file into it - one
+        table per layer, reusing the SAME table for a layer across
+        syncs (remembered via state_store) so:
+          - a layer is never added as a duplicate table, and
+          - a layer's table IS refreshed with current data every sync,
+            not just the first time it's merged in.
         """
         state = state_store.load_state(profile_dir, user_id)
         local_path = state.get("local_gpkg_path")
@@ -332,9 +343,9 @@ class SyncManager:
             os.makedirs(working_dir, exist_ok=True)
             local_path = os.path.join(working_dir, f"{user_id}_working.gpkg")
             state["local_gpkg_path"] = local_path
-            state["layers_in_gpkg"] = []
+            state["layer_tables"] = {}
 
-        merged_identities = set(state.get("layers_in_gpkg", []))
+        layer_tables = dict(state.get("layer_tables") or {})
         existing_tables = _list_gpkg_tables(local_path)
 
         candidates = [
@@ -348,15 +359,18 @@ class SyncManager:
 
         for lyr in candidates:
             identity = state_store.layer_identity(lyr)
-            if identity in merged_identities:
-                continue
+            table_name = layer_tables.get(identity)
 
-            table_name = _safe_table_name(lyr.name())
-            suffix = 1
-            base_table_name = table_name
-            while table_name in existing_tables:
-                suffix += 1
-                table_name = f"{base_table_name}_{suffix}"
+            if table_name is None:
+                # First time seeing this layer - pick a table name that
+                # doesn't collide with anything already in the file.
+                table_name = _safe_table_name(lyr.name())
+                base_table_name = table_name
+                suffix = 1
+                while table_name in existing_tables:
+                    suffix += 1
+                    table_name = f"{base_table_name}_{suffix}"
+                existing_tables.add(table_name)
 
             layer_to_write, rename_note = _prepare_layer_for_gpkg(lyr)
             if rename_note:
@@ -367,6 +381,9 @@ class SyncManager:
             options = QgsVectorFileWriter.SaveVectorOptions()
             options.driverName = "GPKG"
             options.layerName = table_name
+            # Always CreateOrOverwriteLayer once the file exists, so a
+            # layer already merged in gets its table's data refreshed
+            # (not skipped, and not duplicated) on every sync.
             options.actionOnExistingFile = (
                 QgsVectorFileWriter.CreateOrOverwriteLayer
                 if file_exists_on_disk
@@ -382,17 +399,16 @@ class SyncManager:
 
             if error != QgsVectorFileWriter.NoError:
                 QgsMessageLog.logMessage(
-                    f"Failed to add layer '{lyr.name()}' to working GeoPackage "
+                    f"Failed to write layer '{lyr.name()}' into working GeoPackage "
                     f"(code {error}): {err_msg}",
                     PLUGIN_NAME, level=Qgis.Warning,
                 )
                 continue
 
             file_exists_on_disk = True
-            existing_tables.add(table_name)
-            merged_identities.add(identity)
+            layer_tables[identity] = table_name
 
-        state["layers_in_gpkg"] = list(merged_identities)
+        state["layer_tables"] = layer_tables
         state_store.save_state(profile_dir, user_id, state)
         return local_path
 
@@ -426,23 +442,13 @@ class SyncManager:
             self._log_attempt(profile_dir, user_id, layer.name(), action, "", "failed", detail, when)
             return {"error": detail}
 
-        # 3. Versioned remote filename: <basename>_vYYYYMMDD_HHMMSS.gpkg (24h clock).
-        base_name = os.path.splitext(os.path.basename(local_path))[0]
-        timestamp = when.strftime("%Y%m%d_%H%M%S")
-        candidate_name = f"{base_name}_v{timestamp}.gpkg"
+        # 3. Stable remote filename - the local file's own name. No
+        #    timestamp: "roads.gpkg" always means "current roads data".
+        remote_filename = os.path.basename(local_path)
 
+        # 4. Check exists online -> replace; not found -> create.
         try:
-            remote_filename = unique_remote_name(
-                client_secret_path, token_cache_path, user_folder_id, candidate_name
-            )
-        except DriveUploaderError as e:
-            detail = str(e)
-            self._log_attempt(profile_dir, user_id, layer.name(), action, candidate_name, "failed", detail, when)
-            return {"error": detail}
-
-        # 4. Upload as a brand-new version - never overwrite an existing file.
-        try:
-            upload_new_version(
+            upload_or_replace(
                 client_secret_path, token_cache_path, user_folder_id, local_path, remote_filename
             )
         except DriveUploaderError as e:
