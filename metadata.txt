@@ -1,0 +1,28 @@
+[general]
+name=GDrive Spatial Sync
+qgisMinimumVersion=3.16
+qgisMaximumVersion=3.99
+description=Auto-sync edited layer data to a per-user GeoPackage in an organizational Google Drive (Shared Drive).
+version=1.0.1
+author=Rey Mark Balaod
+email=reymarkbalaod@gmail.com
+
+about=Watches a chosen QGIS layer for edits (on commit) and uploads the
+    layer's data as a per-user GeoPackage to a Shared Drive folder using
+    a Google Drive service account. Each user syncs to their own file,
+    so there are never write conflicts between users.
+
+tracker=https://github.com/yourorg/gdrive-sync-plugin/issues
+repository=https://github.com/yourorg/gdrive-sync-plugin
+tags=sync,google drive,geopackage,backup,collaboration
+homepage=https://github.com/yourorg/gdrive-sync-plugin
+category=Plugins
+icon=icon.png
+experimental=False
+deprecated=False
+server=False
+
+# No hard Qt version pin here - QGIS's own qgis.PyQt shim handles
+# PyQt5 (QGIS <= 3.34ish) vs PyQt6 (newer QGIS builds) automatically,
+# as long as all code below imports from qgis.PyQt and never from
+# PyQt5/PyQt6 directly.
