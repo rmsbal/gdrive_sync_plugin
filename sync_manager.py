@@ -45,7 +45,7 @@ from qgis.core import (
 from .settings_dialog import get_setting, get_client_secret_path
 from .drive_uploader import (
     DriveUploaderError, resolve_user_paths, unique_remote_name,
-    upload_new_version, upload_or_replace,
+    upload_new_version, upload_or_replace, has_uploaded_version,
 )
 from . import state_store
 from . import edit_logger
@@ -222,6 +222,97 @@ class SyncManager:
         )
         self._tasks.append(task)
         QgsApplication.taskManager().addTask(task)
+
+    # ------------------------------------------------------------------
+    # Seed upload: "is this GeoPackage online yet at all?" check, run
+    # when a layer is opened/added to the project rather than on edit.
+    # If Drive has no version of it, this triggers a normal sync so a
+    # brand-new file doesn't sit local-only until someone edits it.
+    # ------------------------------------------------------------------
+    def seed_upload_if_missing(self, layer):
+        if layer is None or not isinstance(layer, QgsVectorLayer):
+            return
+
+        user_id = get_setting("user_id", "")
+        client_secret_path = get_client_secret_path()
+        root_folder_id = get_setting("drive_folder_id", "")
+
+        # Settings aren't filled in yet, or no usable client secret -
+        # this is a passive background check, so stay quiet rather
+        # than popping an error for every layer opened.
+        if not user_id or not root_folder_id:
+            return
+        if not os.path.exists(client_secret_path):
+            return
+        if self._is_placeholder_client_secret(client_secret_path):
+            return
+
+        profile_dir = _profile_dir()
+        token_cache_path = os.path.join(
+            profile_dir, "gdrive_sync_plugin", f"{user_id}_token.json"
+        )
+
+        task = QgsTask.fromFunction(
+            f"Check online copy for '{layer.name()}'",
+            self._seed_check_task,
+            on_finished=self._seed_check_finished,
+            layer=layer,
+            user_id=user_id,
+            client_secret_path=client_secret_path,
+            token_cache_path=token_cache_path,
+            root_folder_id=root_folder_id,
+            profile_dir=profile_dir,
+        )
+        self._tasks.append(task)
+        QgsApplication.taskManager().addTask(task)
+
+    def _seed_check_task(self, task, layer, user_id, client_secret_path, token_cache_path,
+                          root_folder_id, profile_dir):
+        # Figure out which local GeoPackage *would* be uploaded for this
+        # layer, without merging/writing anything yet - just to know
+        # what base name to look for online.
+        if _is_gpkg_backed(layer):
+            local_path = _gpkg_source_path(layer)
+        else:
+            state = state_store.load_state(profile_dir, user_id)
+            local_path = state.get("local_gpkg_path")
+            if not local_path:
+                local_path = os.path.join(
+                    profile_dir, "gdrive_sync_plugin", "working", f"{user_id}_working.gpkg"
+                )
+        base_name = os.path.splitext(os.path.basename(local_path))[0]
+
+        try:
+            user_folder_id, _logs_folder_id = resolve_user_paths(
+                client_secret_path, token_cache_path, root_folder_id, user_id
+            )
+            already_online = has_uploaded_version(
+                client_secret_path, token_cache_path, user_folder_id, base_name
+            )
+        except DriveUploaderError as e:
+            return {"skip": True, "reason": str(e)}
+
+        if already_online:
+            return {"skip": True, "reason": "already online"}
+        return {"skip": False, "layer": layer}
+
+    def _seed_check_finished(self, exception, result=None):
+        if exception is not None:
+            QgsMessageLog.logMessage(
+                f"Seed-upload check raised an exception: {exception}",
+                PLUGIN_NAME, level=Qgis.Warning,
+            )
+            return
+        if not result or result.get("skip"):
+            return
+
+        layer = result.get("layer")
+        if layer is not None:
+            QgsMessageLog.logMessage(
+                f"No online copy found for '{layer.name()}' yet - uploading an initial version.",
+                PLUGIN_NAME, level=Qgis.Info,
+            )
+            self.sync_layer(layer, manual=True)
 
     # ------------------------------------------------------------------
     # Background worker (runs off the main thread)

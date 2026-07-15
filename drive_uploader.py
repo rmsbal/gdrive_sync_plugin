@@ -174,6 +174,31 @@ def _unique_remote_name_with_service(service, folder_id, filename):
         n += 1
 
 
+def has_uploaded_version(client_secret_json, token_cache_path, folder_id, base_name):
+    """
+    True if a Drive file whose name starts with '<base_name>_v' already
+    exists in folder_id - i.e. this local GeoPackage has already been
+    synced online at least once, under any timestamped version name.
+
+    Used for the "upload automatically if not found online yet" check
+    when a GeoPackage is opened/used in the project, so a file already
+    present on Drive isn't re-uploaded just because it was reloaded.
+    """
+    service = _get_service(client_secret_json, token_cache_path)
+    safe_base = base_name.replace("'", "\\'")
+    query = (
+        f"name contains '{safe_base}_v' and '{folder_id}' in parents and trashed = false"
+    )
+    response = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    return bool(response.get("files"))
+
+
 def upload_new_version(client_secret_json, token_cache_path, folder_id, local_path, remote_filename):
     """
     Always creates a brand-new Drive file (never updates an existing one).
