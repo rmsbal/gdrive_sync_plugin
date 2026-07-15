@@ -1,21 +1,31 @@
 """
-Thin wrapper around the Google Drive API v3.
-
-Uses OAuth2 "installed app" (Desktop) flow with per-user token caching,
-instead of a service account key - because many Workspace orgs now
-block service account key creation via org policy
-(iam.disableServiceAccountKeyCreation). Each user authenticates as
-themselves once; after that, a cached token is reused silently.
+Google Drive access layer for GDrive Spatial Sync.
 
 Kept in its own module and imported lazily (inside functions, not at
 module top level) so a missing dependency doesn't prevent the rest of
 the plugin from loading in QGIS - the user just gets a clear error when
 they try to sync.
+
+New in this revision:
+- resolve_user_paths(): finds/creates a per-user subfolder (and a
+  "logs" subfolder inside it) under the shared root folder, so each
+  user's files live in their own folder instead of all mixed together.
+- unique_remote_name(): never silently overwrites. If a file with the
+  same name already exists in the target folder, a "-1", "-2", ...
+  suffix is added instead, so a naming collision produces a new
+  version rather than clobbering someone else's (or an earlier) file.
+- upload_new_version(): always creates a new Drive file (used for the
+  timestamped GeoPackage uploads - each sync is its own version).
+- upload_or_replace(): finds-and-updates a file with an exact name if
+  it exists, else creates it (used for the daily log CSV, which is
+  meant to accumulate under one stable filename per day).
 """
 
 import os
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+_FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
 class DriveUploaderError(Exception):
@@ -36,48 +46,28 @@ def _get_credentials(client_secret_json, token_cache_path):
         )
 
     creds = None
-
-    # Reuse a cached token from a previous login, if present and valid.
     if os.path.exists(token_cache_path):
         try:
             creds = Credentials.from_authorized_user_file(token_cache_path, SCOPES)
-        except Exception:
-            creds = None  # corrupt/old cache - fall through to re-login
+        except (ValueError, OSError):
+            creds = None
 
-    if creds and creds.valid:
-        return creds
-
-    if creds and creds.expired and creds.refresh_token:
-        try:
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            _save_token(creds, token_cache_path)
-            return creds
-        except Exception:
-            creds = None  # refresh failed - fall through to interactive login
+        else:
+            if not os.path.exists(client_secret_json):
+                raise DriveUploaderError(
+                    f"OAuth client secret not found at: {client_secret_json}"
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(client_secret_json, SCOPES)
+            creds = flow.run_local_server(port=0)
 
-    if not os.path.exists(client_secret_json):
-        raise DriveUploaderError(
-            f"OAuth client secret file not found: {client_secret_json}"
-        )
+        os.makedirs(os.path.dirname(token_cache_path), exist_ok=True)
+        with open(token_cache_path, "w") as f:
+            f.write(creds.to_json())
 
-    try:
-        flow = InstalledAppFlow.from_client_secrets_file(client_secret_json, SCOPES)
-        # Opens the user's default browser for a one-time login/consent.
-        # Blocks the calling thread until the user finishes in the browser -
-        # this runs inside the background QgsTask, so it will NOT freeze
-        # the QGIS UI, but the sync will visibly pause until they approve.
-        creds = flow.run_local_server(port=0)
-    except Exception as e:
-        raise DriveUploaderError(f"OAuth login failed: {e}")
-
-    _save_token(creds, token_cache_path)
     return creds
-
-
-def _save_token(creds, token_cache_path):
-    os.makedirs(os.path.dirname(token_cache_path), exist_ok=True)
-    with open(token_cache_path, "w") as f:
-        f.write(creds.to_json())
 
 
 def _get_service(client_secret_json, token_cache_path):
@@ -88,8 +78,11 @@ def _get_service(client_secret_json, token_cache_path):
 
 
 def find_file_in_folder(service, folder_id, filename):
-    """Returns the file id if a file with this name already exists in the folder, else None."""
-    query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
+    """Returns the file id if a file with this exact name already exists in the folder, else None."""
+    safe_name = filename.replace("'", "\\'")
+    query = (
+        f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
+    )
     response = service.files().list(
         q=query,
         spaces="drive",
@@ -101,21 +94,125 @@ def find_file_in_folder(service, folder_id, filename):
     return files[0]["id"] if files else None
 
 
-def upload_file(client_secret_json, token_cache_path, folder_id, local_path, remote_filename):
+def find_folder_in_parent(service, parent_id, name):
+    """Returns the folder id if a subfolder with this name exists directly under parent_id, else None."""
+    safe_name = name.replace("'", "\\'")
+    query = (
+        f"name = '{safe_name}' and '{parent_id}' in parents and "
+        f"mimeType = '{_FOLDER_MIME}' and trashed = false"
+    )
+    response = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    files = response.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def get_or_create_subfolder(service, parent_id, name):
+    """Finds a subfolder by name under parent_id, creating it if it doesn't exist yet."""
+    existing = find_folder_in_parent(service, parent_id, name)
+    if existing:
+        return existing
+
+    metadata = {
+        "name": name,
+        "mimeType": _FOLDER_MIME,
+        "parents": [parent_id],
+    }
+    created = service.files().create(
+        body=metadata,
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
+    return created["id"]
+
+
+def resolve_user_paths(client_secret_json, token_cache_path, root_folder_id, user_id):
     """
-    Uploads local_path to the given Shared Drive folder as remote_filename,
-    authenticating as the logged-in user (OAuth2, not a service account).
-    Creates the file if it doesn't exist, otherwise updates it in place
-    (Drive keeps automatic revision history on update).
-    Returns the file ID.
+    Ensures a per-user folder structure exists under the shared root folder:
+
+        <root_folder_id>/
+          <user_id>/
+            <user_id's GeoPackage versions land here>
+            logs/
+              <user_id's daily edit-log CSVs land here>
+
+    Returns (user_folder_id, logs_folder_id).
+    """
+    service = _get_service(client_secret_json, token_cache_path)
+    user_folder_id = get_or_create_subfolder(service, root_folder_id, user_id)
+    logs_folder_id = get_or_create_subfolder(service, user_folder_id, "logs")
+    return user_folder_id, logs_folder_id
+
+
+def unique_remote_name(client_secret_json, token_cache_path, folder_id, filename):
+    """
+    Returns a filename guaranteed not to collide with an existing file in
+    folder_id. If `filename` is already free, it's returned unchanged.
+    Otherwise "-1", "-2", ... is inserted before the extension until a
+    free name is found - so a conflict produces a new version file
+    instead of overwriting whatever is already there.
+    """
+    service = _get_service(client_secret_json, token_cache_path)
+    return _unique_remote_name_with_service(service, folder_id, filename)
+
+
+def _unique_remote_name_with_service(service, folder_id, filename):
+    if find_file_in_folder(service, folder_id, filename) is None:
+        return filename
+
+    base, ext = os.path.splitext(filename)
+    n = 1
+    while True:
+        candidate = f"{base}-{n}{ext}"
+        if find_file_in_folder(service, folder_id, candidate) is None:
+            return candidate
+        n += 1
+
+
+def upload_new_version(client_secret_json, token_cache_path, folder_id, local_path, remote_filename):
+    """
+    Always creates a brand-new Drive file (never updates an existing one).
+    Used for the timestamped GeoPackage uploads: each sync is its own
+    version, so a name collision is resolved by versioning the name
+    rather than by overwriting, and this call assumes `remote_filename`
+    has already been made unique via unique_remote_name().
+
+    Returns the new file's Drive file ID.
     """
     from googleapiclient.http import MediaFileUpload
 
     service = _get_service(client_secret_json, token_cache_path)
-    media = MediaFileUpload(local_path, mimetype="application/geopackage+sqlite3", resumable=True)
+    media = MediaFileUpload(local_path, resumable=True)
+    metadata = {"name": remote_filename, "parents": [folder_id]}
+    created = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
+    return created["id"]
+
+
+def upload_or_replace(client_secret_json, token_cache_path, folder_id, local_path, remote_filename):
+    """
+    Finds a file named exactly `remote_filename` in folder_id and updates
+    its content in place if it exists, else creates it. Used for the
+    daily edit-log CSV, which is meant to accumulate under one stable
+    filename per day rather than spawn a new file per sync.
+
+    Returns the file's Drive file ID.
+    """
+    from googleapiclient.http import MediaFileUpload
+
+    service = _get_service(client_secret_json, token_cache_path)
+    media = MediaFileUpload(local_path, resumable=True)
 
     existing_id = find_file_in_folder(service, folder_id, remote_filename)
-
     if existing_id:
         updated = service.files().update(
             fileId=existing_id,
@@ -123,12 +220,25 @@ def upload_file(client_secret_json, token_cache_path, folder_id, local_path, rem
             supportsAllDrives=True,
         ).execute()
         return updated["id"]
-    else:
-        metadata = {"name": remote_filename, "parents": [folder_id]}
-        created = service.files().create(
-            body=metadata,
-            media_body=media,
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()
-        return created["id"]
+
+    metadata = {"name": remote_filename, "parents": [folder_id]}
+    created = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
+    return created["id"]
+
+
+# Kept for backward compatibility with any external caller expecting the
+# old single-file "upload or overwrite" behaviour.
+def upload_file(client_secret_json, token_cache_path, folder_id, local_path, remote_filename):
+    """
+    Legacy helper: uploads local_path as remote_filename, overwriting any
+    existing file of that exact name in folder_id (Drive keeps automatic
+    revision history on update). Returns the file ID.
+    """
+    return upload_or_replace(
+        client_secret_json, token_cache_path, folder_id, local_path, remote_filename
+    )
